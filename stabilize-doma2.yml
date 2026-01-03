@@ -1,0 +1,83 @@
+---
+- name: Stabilize Server (Disable ASPM, Audio, and Maximize CPU Performance)
+  hosts: localhost
+  become: yes
+  vars:
+    # Adjust this if your ZFS pool name is different
+    zfs_pool_name: data
+
+  tasks:
+    # -------------------------------------------------------
+    # 1. THE CRITICAL FIX: Disabling PCIe Power Management
+    # USE AT YOUR OWN RISK!
+    # -------------------------------------------------------
+    - name: Ensure pcie_aspm=off is present in GRUB config
+      lineinfile:
+        path: /etc/default/grub
+        regexp: '^(GRUB_CMDLINE_LINUX_DEFAULT=")(.*)"$'
+        # If pcie_aspm=off is missing, append it inside the quotes
+        line: '\1\2 pcie_aspm=off"'
+        backrefs: yes
+      notify: update_grub
+      # This check prevents adding the flag multiple times
+      when: ansible_cmdline.pcie_aspm is not defined or ansible_cmdline.pcie_aspm != 'off'
+
+    # -------------------------------------------------------
+    # 2. LOG CLEANUP: Blacklisting Audio Drivers
+    # -------------------------------------------------------
+    - name: Create audio driver blacklist configuration
+      copy:
+        dest: /etc/modprobe.d/blacklist-audio.conf
+        content: |
+          blacklist snd_hda_intel
+          blacklist snd_sof_pci_intel_icl
+          blacklist snd_sof_intel_hda_common
+        owner: root
+        group: root
+        mode: '0644'
+      notify: update_initramfs
+
+    # -------------------------------------------------------
+    # 3. CPU PERFORMANCE: Force 'Performance' Governor
+    # -------------------------------------------------------
+    - name: Install cpufrequtils
+      apt:
+        name: cpufrequtils
+        state: present
+        update_cache: yes
+
+    - name: Configure CPU governor to 'performance' on boot
+      lineinfile:
+        path: /etc/default/cpufrequtils
+        regexp: '^GOVERNOR='
+        line: 'GOVERNOR="performance"'
+        create: yes
+      notify: restart_cpufrequtils
+
+    # -------------------------------------------------------
+    # 4. ZFS MAINTENANCE (Runtime Check)
+    # -------------------------------------------------------
+    - name: Check ZFS pool status
+      command: zpool status {{ zfs_pool_name }}
+      register: zpool_check
+      changed_when: false
+      ignore_errors: yes
+
+    - name: Clear ZFS errors if pool shows unrecoverable errors
+      command: zpool clear {{ zfs_pool_name }}
+      when: "'One or more devices has experienced an unrecoverable error' in zpool_check.stdout"
+
+  # -------------------------------------------------------
+  # HANDLERS
+  # -------------------------------------------------------
+  handlers:
+    - name: update_grub
+      command: update-grub
+
+    - name: update_initramfs
+      command: update-initramfs -u
+
+    - name: restart_cpufrequtils
+      service:
+        name: cpufrequtils
+        state: restarted
